@@ -1,215 +1,143 @@
-# bot.py
 import discord
 from discord.ext import tasks
-import json
+import yaml
 import random
 import asyncio
-from datetime import datetime
-import os
 import logging
-from dotenv import load_dotenv
+import json # [NEW] Added for state management
+import os   # [NEW] Added for file checking
+from datetime import datetime, timezone, timedelta
 
-# --- 1. SETUP LOGGING ---
-# Create a logger that prints timestamped messages to your terminal
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] [%(levelname)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
+# --- 1. SETUP & CONFIGURATION ---
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 log = logging.getLogger(__name__)
 
-# --- 2. LOAD CONFIGURATION FROM .env FILE ---
-log.info("Loading configuration from .env file...")
-load_dotenv()
-TOKEN = os.getenv('DISCORD_TOKEN')
-try:
-    MARKET_CHANNEL_ID = int(os.getenv('MARKET_CHANNEL_ID'))
-except (ValueError, TypeError):
-    MARKET_CHANNEL_ID = None # Handle case where it's missing or invalid
+def load_config():
+    try:
+        with open('config.yaml', 'r') as f:
+            log.info("Loading configuration from config.yaml...")
+            return yaml.safe_load(f)
+    except FileNotFoundError:
+        log.error("FATAL: config.yaml not found! Please create it and fill it out.")
+        return None
+config = load_config()
+if not config: exit()
+
+# --- 2. STATE MANAGEMENT (THE FIX) ---
+STATE_FILE = 'state.json'
+bot_state = {
+    "is_on_break": False,
+    "phase_end_time_iso": None
+}
+
+def load_state():
+    """Loads the bot's state from a file."""
+    global bot_state
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, 'r') as f:
+            bot_state = json.load(f)
+            log.info(f"Loaded previous state from {STATE_FILE}.")
+    else:
+        log.info(f"{STATE_FILE} not found. Starting with a fresh state.")
+
+def save_state():
+    """Saves the bot's current state to a file."""
+    with open(STATE_FILE, 'w') as f:
+        json.dump(bot_state, f, indent=4)
+    log.info(f"Bot state saved to {STATE_FILE}.")
 
 # --- 3. GLOBAL VARIABLES ---
-DATA_FILE = 'market_data.json'
 client = discord.Client()
-market_data = {"market_message_id": None, "listings": []}
+# This timestamp is critical. We only process joins that happen AFTER this time.
+PROCESS_JOINS_AFTER = datetime.now(timezone.utc)
 
-# Import our custom settings and messages (no changes needed in those files)
-import human
-import msg
-
-# --- DATA HANDLING ---
-def load_data():
-    """Loads market data from the JSON file into memory."""
-    global market_data
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, 'r') as f:
-            try:
-                market_data = json.load(f)
-                log.info(f"Successfully loaded data from {DATA_FILE}.")
-            except json.JSONDecodeError:
-                log.warning(f"{DATA_FILE} is corrupted or empty. Starting with a fresh data set.")
-                market_data = {"market_message_id": None, "listings": []}
+# (The schedule_wave function from the previous code is perfect and needs no changes)
+async def schedule_wave(message: discord.Message):
+    user = message.author
+    delay = random.uniform(config['human_touch']['min_wave_delay_seconds'], config['human_touch']['max_wave_delay_seconds'])
+    log.info(f"SCHEDULING WAVE for user '{user.name}'. Action will be performed in {delay / 60:.2f} minutes.")
+    await asyncio.sleep(delay)
+    try:
+        log.info(f"WAVE TIME for '{user.name}'. Fetching latest message state.")
+        message = await message.channel.fetch_message(message.id)
+    except discord.NotFound:
+        log.warning(f"Message for user '{user.name}' was deleted. Skipping.")
+        return
+    wave_button = discord.utils.find(lambda c: isinstance(c, discord.Button) and c.label == "Wave to say hi!", message.components[0].children)
+    if wave_button:
+        log.info(f"Button found for '{user.name}'. Attempting to click...")
+        try:
+            await wave_button.click()
+            log.info(f"SUCCESS: Successfully waved to '{user.name}'.")
+        except Exception as e:
+            log.error(f"FAILED to click wave button for '{user.name}'. Error: {e}")
     else:
-        log.info(f"{DATA_FILE} not found. A new one will be created on the first save.")
+        log.warning(f"Could not find 'Wave to say hi!' button for '{user.name}'.")
 
-def save_data():
-    """Saves the current market data from memory to the JSON file."""
-    with open(DATA_FILE, 'w') as f:
-        json.dump(market_data, f, indent=4)
-    log.info(f"Market data saved to {DATA_FILE}.")
-
-# --- CORE EVENTS ---
+# --- 4. DISCORD EVENT HANDLERS ---
 @client.event
 async def on_ready():
-    """Called when the bot successfully connects to Discord."""
+    global PROCESS_JOINS_AFTER
     log.info(f"Logged in as {client.user.name} ({client.user.id})")
-    log.info("Bot is ready and listening for DMs.")
-    load_data()
-    update_market_board.start() # Start the periodic update loop
-    log.info(f"Market update loop scheduled to run every {human.MARKET_UPDATE_INTERVAL_MINUTES} minutes.")
+    log.info(f"Monitoring welcome channel ID: {config['discord_settings']['welcome_channel_id']}")
+    load_state() # [FIX] Load the persistent state on startup
+    PROCESS_JOINS_AFTER = datetime.now(timezone.utc)
+    log.info(f"Initialization complete. Will process joins after {PROCESS_JOINS_AFTER.strftime('%Y-%m-%d %H:%M:%S')}")
+    manage_breaks.start()
 
 @client.event
-async def on_message(message):
-    """Called for every message the user account can see."""
-    # We only care about DMs sent to us, and not from ourself
-    if not isinstance(message.channel, discord.DMChannel) or message.author == client.user:
+async def on_message(message: discord.Message):
+    if bot_state["is_on_break"]: return
+    if message.channel.id != config['discord_settings']['welcome_channel_id']: return
+    if message.type != discord.MessageType.new_member: return
+    if message.created_at < PROCESS_JOINS_AFTER:
+        log.info(f"Ignoring old join message for '{message.author.name}'.")
         return
+    log.info(f"DETECTED new member join: '{message.author.name}'. Handing off to wave scheduler.")
+    asyncio.create_task(schedule_wave(message))
 
-    log.info(f"Received DM from {message.author.name}: '{message.content}'")
-    content = message.content.lower().strip()
+# --- 5. REWRITTEN BREAK MANAGEMENT TASK (THE FIX) ---
+@tasks.loop(minutes=1) # Check every minute to see if we need to change state
+async def manage_breaks():
+    global bot_state, PROCESS_JOINS_AFTER
+    now = datetime.now(timezone.utc)
+    
+    # Check if a phase end time exists and if we have passed it
+    phase_end_time = datetime.fromisoformat(bot_state["phase_end_time_iso"]) if bot_state["phase_end_time_iso"] else None
 
-    if not content.startswith('sell'):
-        log.info("DM did not start with 'sell', ignoring.")
+    if phase_end_time and now < phase_end_time:
+        # We are in the middle of a saved phase. Do nothing and wait.
+        remaining_time = phase_end_time - now
+        log.info(f"Continuing current phase. {'Break' if bot_state['is_on_break'] else 'Active'} phase ends in {remaining_time.total_seconds() / 60:.2f} minutes.")
         return
-
-    log.info("Attempting to parse listing from DM...")
-    parts = content.split()
-    try:
-        # Expected format: sell [amount] [item] for [price_amount] [price_item]
-        if len(parts) != 6 or parts[0] != 'sell' or parts[3] != 'for':
-            raise ValueError("Incorrect command structure.")
-
-        quantity = int(parts[1])
-        item_name = parts[2]
-        price_amount = int(parts[4])
-        price_item = parts[5]
-        log.info(f"Successfully parsed listing: {quantity} {item_name} for {price_amount} {price_item}")
-
-        new_listing = {
-            "seller_id": str(message.author.id),
-            "seller_name": message.author.name,
-            "item_name": item_name,
-            "quantity": quantity,
-            "price_item": price_item,
-            "price_amount": price_amount,
-            "timestamp": datetime.utcnow().isoformat()
-        }
-        market_data['listings'].append(new_listing)
-        save_data()
-
-        # --- Human Touch: Delayed & Varied DM Reply ---
-        delay = random.uniform(human.MIN_DM_REPLY_DELAY_SECONDS, human.MAX_DM_REPLY_DELAY_SECONDS)
-        log.info(f"Waiting for {delay:.2f} seconds before replying...")
-        await asyncio.sleep(delay)
         
-        async with message.channel.typing():
-            typing_duration = random.uniform(human.MIN_TYPING_SECONDS, human.MAX_TYPING_SECONDS)
-            log.info(f"Simulating typing for {typing_duration:.2f} seconds...")
-            await asyncio.sleep(typing_duration)
-            reply_text = msg.get_random_dm_reply(item_name, quantity, price_item, price_amount)
-            await message.channel.send(reply_text)
-            log.info(f"Sent DM reply to {message.author.name}.")
-
-    except (ValueError, IndexError) as e:
-        log.warning(f"Failed to parse DM. Error: {e}. Sending help message.")
-        await message.channel.send(msg.HELP_MESSAGE)
-
-# --- BACKGROUND TASK ---
-@tasks.loop(minutes=human.MARKET_UPDATE_INTERVAL_MINUTES)
-async def update_market_board():
-    """The main background loop that periodically updates the market board."""
-    log.info("--- Starting scheduled market update task ---")
-    
-    channel = client.get_channel(MARKET_CHANNEL_ID)
-    if not channel:
-        log.error(f"FATAL: Cannot find channel with ID {MARKET_CHANNEL_ID}. Please check your .env file.")
-        return
-
-    # 1. Build the formatted text for the board
-    log.info("Grouping and calculating cheapest listings...")
-    grouped_items = {}
-    for listing in market_data['listings']:
-        item = listing['item_name']
-        if item not in grouped_items: grouped_items[item] = []
-        grouped_items[item].append(listing)
-
-    market_body_parts = []
-    if not grouped_items:
-        market_body_parts.append("The market is currently empty! DM me to list your items.")
+    # If we are here, it means the previous phase ended or it's the first run. Time to start a new phase.
+    if bot_state["is_on_break"]:
+        # --- End Break, Start Active Phase ---
+        duration_hours = random.uniform(config['break_schedule']['min_active_hours'], config['break_schedule']['max_active_hours'])
+        end_time = now + timedelta(hours=duration_hours)
+        bot_state["is_on_break"] = False
+        bot_state["phase_end_time_iso"] = end_time.isoformat()
+        PROCESS_JOINS_AFTER = now # Update the timestamp to ignore joins during the break
+        log.info(f"BREAK IS OVER. Bot is now ACTIVE. Next break in {duration_hours:.2f} hours.")
+        save_state()
     else:
-        for item_name in sorted(grouped_items.keys()):
-            listings = grouped_items[item_name]
-            cheapest = min(listings, key=lambda x: x['price_amount'] / x['quantity'])
-            ppu = cheapest['price_amount'] / cheapest['quantity']
-            price_per_unit_str = f"{ppu:.2f}".rstrip('0').rstrip('.')
-            market_body_parts.append(
-                f"**<:arrow:1185568475253891152> {item_name.replace('_', ' ').title()}**\n"
-                f"  • **Cheapest:** `{price_per_unit_str} {cheapest['price_item']}` per unit (Sold by `{cheapest['seller_name']}`)\n"
-                f"  • **Total Listings:** `{len(listings)}`"
-            )
-    log.info(f"Generated market body with {len(grouped_items)} item groups.")
-    market_body = "\n\n".join(market_body_parts)
-    
-    now_time = datetime.now().strftime("%I:%M %p UTC")
-    full_message_content = msg.MARKET_BOARD_TEMPLATE.format(market_body=market_body, last_updated=now_time)
+        # --- End Active, Start Break Phase ---
+        duration_minutes = random.uniform(config['break_schedule']['min_break_minutes'], config['break_schedule']['max_break_minutes'])
+        end_time = now + timedelta(minutes=duration_minutes)
+        bot_state["is_on_break"] = True
+        bot_state["phase_end_time_iso"] = end_time.isoformat()
+        log.info(f"STARTING BREAK. Bot will be offline for {duration_minutes:.2f} minutes.")
+        save_state()
 
-    # 2. **[FIXED LOGIC]** Safely fetch, edit, or create the message
-    message_to_edit = None
-    if market_data.get('market_message_id'):
-        try:
-            log.info(f"Attempting to fetch existing market message with ID: {market_data['market_message_id']}")
-            message_to_edit = await channel.fetch_message(market_data['market_message_id'])
-            log.info("Successfully fetched existing message.")
-        except discord.NotFound:
-            log.warning("Market message not found (it was likely deleted). Will post a new one.")
-            market_data['market_message_id'] = None # Clear the invalid ID
-        except discord.Forbidden:
-            log.error(f"I don't have permission to read message history in channel {MARKET_CHANNEL_ID}. Cannot update.")
-            return # Can't proceed
-        except Exception as e:
-            log.error(f"An unexpected error occurred while fetching the message: {e}")
-            return
-
-    # --- Human Touch: Typing Simulation ---
-    async with channel.typing():
-        typing_duration = random.uniform(human.MIN_TYPING_SECONDS, human.MAX_TYPING_SECONDS)
-        log.info(f"Simulating typing in market channel for {typing_duration:.2f} seconds...")
-        await asyncio.sleep(typing_duration)
-    
-        try:
-            if message_to_edit:
-                await message_to_edit.edit(content=full_message_content)
-                log.info("Market board message successfully EDITED.")
-            else:
-                log.info("No existing message found, POSTING a new market board.")
-                new_message = await channel.send(full_message_content)
-                market_data['market_message_id'] = new_message.id
-                log.info(f"New market board posted. Message ID: {new_message.id}")
-            save_data() # Save the new message ID if created
-        except discord.Forbidden:
-            log.error(f"I don't have permission to send/edit messages in channel {MARKET_CHANNEL_ID}. Please check permissions.")
-        except Exception as e:
-            log.error(f"An unexpected error occurred during message update: {e}")
-
-    log.info("--- Market update task finished ---")
-
-@update_market_board.before_loop
-async def before_update_loop():
+@manage_breaks.before_loop
+async def before_manage_breaks():
     await client.wait_until_ready()
 
-# --- RUN THE BOT ---
+# --- 6. RUN THE BOT ---
 if __name__ == "__main__":
-    if not TOKEN or not MARKET_CHANNEL_ID:
-        log.error("FATAL: DISCORD_TOKEN or MARKET_CHANNEL_ID is missing from your .env file.")
-        log.error("Please create a .env file and fill it with your credentials.")
+    TOKEN = config.get('discord_settings', {}).get('token')
+    if not TOKEN or TOKEN == "YOUR_TOKEN_HERE":
+        log.error("FATAL: Token is missing or not set in config.yaml! Please update the file.")
     else:
         client.run(TOKEN)
