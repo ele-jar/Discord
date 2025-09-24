@@ -1,0 +1,34 @@
+# -----------------------------------------------------------------
+#               CONFIGURATION FOR THE WELCOME WAVER BOT
+# -----------------------------------------------------------------
+
+discord_settings:
+  # Your secret Discord account token. Keep this private.
+  token: "YOUR_TOKEN_HERE"
+  
+  # The ID of the #welcome channel to monitor.
+  welcome_channel_id: 1408543778981150823
+
+human_touch:
+  # --- WAVE DELAY ---
+  # The bot will wait for a random amount of time within this range
+  # before it "waves" to a new member. This simulates a human seeing
+  # the notification and then reacting.
+  # (Values are in seconds)
+  min_wave_delay_seconds: 90    # Example: 1.5 minutes
+  max_wave_delay_seconds: 250  # Example: 5 minutes
+
+break_schedule:
+  # --- ACTIVE DURATION ---
+  # How long the bot should be "online" and active before taking a break.
+  # A random duration between these two values will be chosen each time.
+  # (Values are in hours)
+  min_active_hours: 1
+  max_active_hours: 2
+
+  # --- BREAK DURATION ---
+  # How long the bot's breaks should be.
+  # A random duration between these two values will be chosen.
+  # (Values are in minutes)
+  min_break_minutes: 15
+  max_break_minutes: 30
